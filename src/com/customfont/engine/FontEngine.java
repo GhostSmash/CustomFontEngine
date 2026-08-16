@@ -58,15 +58,72 @@ public class FontEngine {
     private static final Map<View, Typeface> appliedViews =
             java.util.Collections.synchronizedMap(new WeakHashMap<View, Typeface>());
 
-    // Кэш reflection-полей textPaint/paint по классу, чтобы не искать их
-    // заново для каждого элемента при каждом проходе.
-    private static final Map<Class<?>, Field> paintFieldCache =
-            new java.util.concurrent.ConcurrentHashMap<Class<?>, Field>();
+    // Кэш reflection-полей типа Paint по классу (может быть несколько на
+    // класс — например namePaint + statusPaint в одной ячейке), чтобы не
+    // сканировать иерархию заново для каждого элемента при каждом проходе.
+    private static final Map<Class<?>, Field[]> paintFieldCache =
+            new java.util.concurrent.ConcurrentHashMap<Class<?>, Field[]>();
 
     // Кэш статических Paint-полей класса Theme, найденных один раз при
     // первой установке — дальше просто перебираем этот список.
     private static volatile Field[] themeStaticPaintFields = null;
     private static volatile Field[] themeStaticPaintArrayFields = null;
+
+    private static volatile float textScale = 1.0f;
+    private static volatile float letterSpacing = 0f;
+    private static volatile boolean forceBoldHeaders = false;
+
+    /**
+     * Задаёт дополнительные параметры оформления текста — масштаб, интервал
+     * между буквами, принудительную жирность заголовков. Применяются в
+     * applyRecursive вместе с обычной подменой typeface, без отдельного
+     * прохода по дереву.
+     *
+     * Диапазоны намеренно НЕ валидируются здесь на уровне движка — этим
+     * занимается Python-сторона перед вызовом (см. _on_dev_scale_change и
+     * соседние методы в плагине), чтобы явно показать пользователю причину
+     * отказа. Движок принимает уже провалидированные значения как есть.
+     */
+    public static void setTextParams(float scale, float spacing, boolean boldHeaders) {
+        textScale = scale;
+        letterSpacing = spacing;
+        forceBoldHeaders = boldHeaders;
+        textParamsVersion++;
+        // Сбрасываем кэш обработанных View целиком — при смене dev-параметров
+        // (масштаб/интервал/жирность) нужно перепройтись по всем элементам
+        // заново, даже если typeface у них не поменялся. appliedViews хранит
+        // typeface, а не версию параметров, поэтому проще инвалидировать всё.
+        appliedViews.clear();
+    }
+
+    private static volatile int textParamsVersion = 0;
+
+    /**
+     * Патчит static поля класса org.telegram.messenger.AndroidUtilities —
+     * там, помимо кэша typefaceCache (который правильнее чистить, а не
+     * подменять — новый вызов getTypeface() создаст Typeface из нашего
+     * файла заново), могут быть отдельные static Paint-поля, аналогично
+     * Theme. Передаём имя класса из Python, чтобы не завязываться на
+     * конкретный пакет намертво в самом движке.
+     */
+    public static int patchAndroidUtilitiesPaints(String androidUtilitiesClassName) {
+        return patchThemePaints(androidUtilitiesClassName);
+    }
+
+    /**
+     * Единая точка входа, объединяющая все шаги патчинга статики за один
+     * вызов из Python — сокращает количество пересечений границы Chaquopy
+     * с нескольких вызовов до одного.
+     */
+    public static int patchAllStatics(String themeClassName, String androidUtilitiesClassName) {
+        patchTypefaceStatics();
+        int a = patchThemePaints(themeClassName);
+        int b = 0;
+        if (androidUtilitiesClassName != null && !androidUtilitiesClassName.equals(themeClassName)) {
+            b = patchThemePaints(androidUtilitiesClassName);
+        }
+        return a + b;
+    }
 
     private FontEngine() {
     }
@@ -193,6 +250,7 @@ public class FontEngine {
                 Typeface current = tv.getTypeface();
                 int style = current != null ? current.getStyle() : 0;
                 tv.setTypeface(typeface, style);
+                applyTextParams(tv);
                 appliedViews.put(view, typeface);
                 count++;
             } else {
@@ -217,16 +275,64 @@ public class FontEngine {
         return count;
     }
 
+    private static void applyTextParams(TextView tv) {
+        try {
+            // textScale масштабирует относительно ТЕКУЩЕГО размера, а не
+            // абсолютно — так каждый элемент сохраняет свою исходную
+            // иерархию размеров (заголовки крупнее подписей и т.п.),
+            // просто пропорционально увеличиваясь или уменьшаясь.
+            if (Math.abs(textScale - 1.0f) > 0.001f) {
+                float currentSizePx = tv.getTextSize();
+                // Защита от накопительного масштабирования при повторных
+                // проходах: используем тег на View, чтобы помнить
+                // "базовый" размер до масштабирования, а не масштабировать
+                // уже смасштабированное значение на каждый проход.
+                Object baseTag = tv.getTag(BASE_SIZE_TAG_KEY);
+                float basePx;
+                if (baseTag instanceof Float) {
+                    basePx = (Float) baseTag;
+                } else {
+                    basePx = currentSizePx;
+                    tv.setTag(BASE_SIZE_TAG_KEY, basePx);
+                }
+                tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, basePx * textScale);
+            }
+
+            if (Math.abs(letterSpacing) > 0.0001f) {
+                tv.setLetterSpacing(letterSpacing);
+            }
+
+            if (forceBoldHeaders) {
+                String className = tv.getClass().getName();
+                boolean looksLikeHeader = className.contains("ActionBar")
+                        || className.toLowerCase().contains("title")
+                        || className.toLowerCase().contains("header");
+                if (looksLikeHeader) {
+                    Typeface current = tv.getTypeface();
+                    tv.setTypeface(current, Typeface.BOLD);
+                }
+            }
+        } catch (Throwable ignored) {
+            // Метод недоступен на этой версии Android/клиента (например,
+            // setLetterSpacing появился только в API 21+) — пропускаем этот
+            // конкретный параметр, остальные продолжают применяться.
+        }
+    }
+
+    // Используем стабильный отрицательный int как ключ тега — не пересекается
+    // с обычными view tag ID, которые генерируются через View.generateViewId()
+    // и всегда положительны.
+    private static final int BASE_SIZE_TAG_KEY = -87234321;
+
     private static boolean applyToCustomClass(View view, Typeface typeface) {
         Class<?> cls = view.getClass();
         String name = cls.getName();
 
-        boolean known = name.equals("org.telegram.ui.ActionBar.SimpleTextView")
-                || name.equals("org.telegram.ui.Components.Text")
-                || name.equals("org.telegram.ui.Components.AnimatedTextView")
-                || name.equals("org.telegram.ui.Cells.DialogCell");
-
-        if (!known) return false;
+        // Работаем только с классами Telegram-клиента (org.telegram.*) —
+        // трогать сторонние/системные виджеты со своими Paint-полями через
+        // reflection рискованно и не нужно, они и так рисуют системным
+        // шрифтом по умолчанию, а не кастомным Telegram-текстом.
+        if (!name.startsWith("org.telegram.")) return false;
 
         try {
             java.lang.reflect.Method m = cls.getMethod("setTypeface", Typeface.class);
@@ -235,24 +341,47 @@ public class FontEngine {
         } catch (Throwable ignored) {
         }
 
-        Field cached = paintFieldCache.get(cls);
+        Field[] cached = paintFieldCache.get(cls);
         if (cached != null) {
-            return trySetPaintField(cached, view, typeface);
+            boolean any = false;
+            for (Field f : cached) {
+                if (trySetPaintField(f, view, typeface)) any = true;
+            }
+            return any;
         }
 
-        String[] candidateFields = {"textPaint", "paint", "namePaint", "titlePaint"};
-        for (String fieldName : candidateFields) {
-            try {
-                Field f = cls.getDeclaredField(fieldName);
-                f.setAccessible(true);
-                if (trySetPaintField(f, view, typeface)) {
-                    paintFieldCache.put(cls, f);
-                    return true;
+        // Универсальное сканирование: ищем ВСЕ поля типа Paint/TextPaint во
+        // всей иерархии классов (сам класс + все родители до Object), а не
+        // только по фиксированному списку имён ("textPaint", "paint" и
+        // т.п.). Реальные имена полей отличаются между версиями клиента и
+        // между разными Cell-классами (namePaint, messagePaint, timePaint,
+        // authorPaint и десятки других) — угадывать их по одному непрактично,
+        // сканирование по типу поля работает независимо от имени и версии.
+        java.util.List<Field> found = new java.util.ArrayList<Field>();
+        Class<?> walker = cls;
+        while (walker != null && walker != Object.class) {
+            for (Field f : walker.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue; // статику здесь не трогаем, она через patchThemePaints
+                Class<?> type = f.getType();
+                if (Paint.class.isAssignableFrom(type)) {
+                    f.setAccessible(true);
+                    found.add(f);
                 }
-            } catch (Throwable ignored) {
             }
+            walker = walker.getSuperclass();
         }
-        return false;
+
+        if (found.isEmpty()) {
+            paintFieldCache.put(cls, new Field[0]);
+            return false;
+        }
+
+        boolean any = false;
+        for (Field f : found) {
+            if (trySetPaintField(f, view, typeface)) any = true;
+        }
+        paintFieldCache.put(cls, found.toArray(new Field[0]));
+        return any;
     }
 
     private static boolean trySetPaintField(Field field, View view, Typeface typeface) {
