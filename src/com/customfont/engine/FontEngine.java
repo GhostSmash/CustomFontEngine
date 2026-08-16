@@ -48,6 +48,9 @@ import java.util.WeakHashMap;
  */
 public class FontEngine {
 
+    // Версия DEX-движка — должна совпадать с версией плагина (FONT_ENGINE_MIN_VERSION..MAX_VERSION)
+    public static final String VERSION = "1.4.0";
+
     private static volatile Typeface currentTypeface = null;
     private static volatile boolean initialized = false;
 
